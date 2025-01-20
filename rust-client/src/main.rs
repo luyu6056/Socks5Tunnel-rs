@@ -83,6 +83,7 @@ async fn main() {
     let connector: Arc<tokio_native_tls::TlsConnector> = Arc::new(
         TlsConnector::builder()
             .identity(identity)
+            .use_sni(false)
             .danger_accept_invalid_certs(true)
             .build()
             .unwrap()
