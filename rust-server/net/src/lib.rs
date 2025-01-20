@@ -77,17 +77,17 @@ impl Server {
         let afterfn = Arc::new(Mutex::new(AfterFn::<A>::new()));
 
         let listener = TcpListener::bind(&addr).await.unwrap();
-        let mut intervalsec = time::interval(Duration::from_secs(1));
+        //let mut intervalsec = time::interval(Duration::from_secs(1));
         let mut intervalms = time::interval(Duration::from_millis(1));
 
         unsafe {
             mod __tokio_select_util {
                 #[derive(Debug)]
-                pub(super) enum Out<_0, _1, _2, _3> {
+                pub(super) enum Out<_0, _1, _2> {
                     _0(_0),
                     _1(_1),
                     _2(_2),
-                    _3(_3),
+                    //_3(_3),
                 }
             }
             loop {
@@ -100,12 +100,12 @@ impl Server {
                         if let Ready(out) = Future::poll(Pin::new_unchecked(f1), cx) {
                             return Ready(__tokio_select_util::Out::_1(out));
                         }
-                        if let Ready(out) = intervalsec.poll_tick(cx) {
+                        if let Ready(out) = intervalms.poll_tick(cx) {
                             return Ready(__tokio_select_util::Out::_2(out));
                         }
-                        if let Ready(out) = intervalms.poll_tick(cx) {
-                            return Ready(__tokio_select_util::Out::_3(out));
-                        }
+                        // if let Ready(out) = intervalsec.poll_tick(cx) {
+                        //     return Ready(__tokio_select_util::Out::_3(out));
+                        // }
                         Pending
                     })
                     .await
@@ -127,7 +127,7 @@ impl Server {
                         }
                     },
 
-                    __tokio_select_util::Out::_3(now) => {
+                    __tokio_select_util::Out::_2(now) => {
                         let mut afterfn = afterfn.lock().await;
                         afterfn.check_delete(now);
                         if let Some((addr, id)) = afterfn.get_taskaddr_from_time(now) {

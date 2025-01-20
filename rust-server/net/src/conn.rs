@@ -196,7 +196,7 @@ impl<T> TcpConn<T> {
     //})});
     pub async fn after_fn<F>(&mut self, delay: time::Duration, f: F)
     where
-        F: for<'b> FnOnce(&'b mut T) -> ConnAsyncResult<'b> + Send + Sync + 'static,
+        F: for<'b> FnOnce(&'b mut T,&'b mut TcpConn<T>) -> ConnAsyncResult<'b> + Send + Sync + 'static,
     {
         self.after_fn.lock().await.add_fn(self.addr(), delay, f);
     }
@@ -349,7 +349,7 @@ where
                             }
                             ReactOperation::Afterfn(id) => {
                                 if let Some(f) = after_fn.lock().await.remove_task(id) {
-                                    f.call_once((agent,)).await?;
+                                    f.call_once((agent,conn)).await?;
                                 };
                             }
                         }

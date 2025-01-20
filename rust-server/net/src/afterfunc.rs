@@ -8,11 +8,13 @@ use std::pin::Pin;
 use std::time;
 use std::time::Duration;
 use tokio::time::Instant;
+use crate::conn::TcpConn;
+
 pub type ConnAsyncFn<T> =
-    Box<dyn for<'a> FnOnce(&'a mut T) -> ConnAsyncResult<'a> + Send + Sync + 'static>;
+    Box<dyn for<'a> FnOnce(&'a mut T,&'a mut TcpConn<T>) -> ConnAsyncResult<'a> + Send + Sync + 'static>;
 pub type ConnAsyncResult<'a> = Pin<Box<dyn Future<Output = Result<(), NetError>> + Send + 'a>>;
 
-pub struct AfterFn<T: ?Sized> {
+pub struct AfterFn<T> {
     no: u64,
     task_time_id: BTreeMap<Instant, u64>, //待处理的task，时间=>id
     pub task_id_fn: BTreeMap<u64, (SocketAddr, ConnAsyncFn<T>)>, //待处理task的 id=>
@@ -40,7 +42,7 @@ impl<T> AfterFn<T> {
     }
     pub fn add_fn<F>(&mut self, addr: SocketAddr, delay: time::Duration, f: F)
     where
-        F: for<'b> FnOnce(&'b mut T) -> ConnAsyncResult<'b> + Send + Sync + 'static,
+        F: for<'b> FnOnce(&'b mut T,&'b mut TcpConn<T>) -> ConnAsyncResult<'b> + Send + Sync + 'static,
     {
         self.no += 1;
         let id = self.no;

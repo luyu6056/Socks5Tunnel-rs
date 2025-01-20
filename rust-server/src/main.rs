@@ -13,23 +13,23 @@ use net::conn::{ConnWrite, ConnWriter, TcpConn};
 use net::err::NetError;
 use net::{Agent, Server};
 use openssl::pkey::PKey;
+use openssl::ssl::{SslAcceptor, SslMethod};
+use openssl::x509::X509;
 use static_init::dynamic;
 use std::collections::HashMap;
 use std::iter::repeat_with;
 use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{*};
+use std::sync::atomic::*;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::net::tcp::OwnedReadHalf;
 use tokio::sync::Mutex;
+use tokio::sync::mpsc::*;
 use tokio::time::{Instant, timeout, timeout_at};
 use tokio_native_tls::native_tls::Identity;
-use tokio::sync::mpsc::{*};
-use openssl::ssl::{SslAcceptor, SslMethod};
-use openssl::x509::X509;
 
 mod cmd;
 pub mod utils;
@@ -189,10 +189,17 @@ struct Conn {
 unsafe impl Send for ServerAgent {}
 impl Agent for ServerAgent {
     async fn on_opened(&mut self, conn: &mut TcpConn<Self>) -> Result<(), NetError> {
-        println!("on_opened {}",conn.addr());
         conn.after_fn(
-            Duration::from_secs(10),
-            |_conn: &mut Self| -> ConnAsyncResult { Box::pin(async move { Ok(()) }) },
+            Duration::from_secs(2),
+            |agent: &mut Self, conn: &mut TcpConn<Self>| -> ConnAsyncResult {
+                Box::pin(async move {
+                    //握手失败关闭连接
+                    if agent.client.is_none(){
+                        conn.close(None::<String>)?;
+                    };
+                    Ok(())
+                })
+            },
         )
         .await;
         let mut mysqlbuf = MsgBuffer::new();
@@ -227,6 +234,7 @@ impl Agent for ServerAgent {
 
         let length = (indata[0] as usize) + ((indata[1] as usize) << 8);
         if indata.len() < length {
+
             return Ok(false);
         }
         let indata = indata[..length].to_vec();
@@ -235,14 +243,13 @@ impl Agent for ServerAgent {
         tcp_conn.shift(length).await?;
         //主逻辑
         #[cfg(debug_assertions)]
-        if DEBUG_LEN==8{
+        if DEBUG_LEN == 8 {
             println!(
                 "cmd: {:?} 开始 耗时{}ms",
                 data.cmd,
                 now().unix_millis() - data.timestamp.unwrap()
             );
         }
-
 
         match &data.cmd {
             Cmd::GetFd => {
@@ -508,7 +515,6 @@ async fn handle_socks(
     let mut buf: Vec<u8> = vec![0; MAX_PLAINTEXT - HEAD_LEN];
 
     while !conn.is_close.load(Ordering::Relaxed) {
-        //let n= read.read(&mut buf[HEADLEN..]).await?;
         let n = match timeout(Duration::from_secs(10), read.read(&mut buf)).await {
             Err(_) => {
                 //#[cfg(debug_assertions)]
@@ -517,7 +523,9 @@ async fn handle_socks(
             }
             Ok(n) => n?,
         };
-        if n > 0 {
+        if n==0{
+            return Err(NetError::TcpDisconnected);
+        }else{
             let data = Data {
                 cmd: Cmd::Msg,
                 fd: conn.fd,
@@ -544,7 +552,6 @@ async fn write_by_conn<T>(stream: &mut T, data: Data<'_>) -> Result<(), NetError
 where
     T: ConnWrite,
 {
-
     if data.body.len() + HEAD_LEN > MAX_PLAINTEXT {
         return Err(NetError::ProtocolErr(format!(
             "data长度 {} 大于 {}",

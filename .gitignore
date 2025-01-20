@@ -1,0 +1,4 @@
+.idea
+/rust-server/perf.data.old
+/rust-server/flamegraph.svg
+/rust-server/perf.data
