@@ -202,7 +202,7 @@ impl ServerConnection {
                                 break;
                             }
                             let data :Data =readbuf[..msglen].into() ;
-                            #[cfg(debug_assertions)]
+                            //#[cfg(debug_assertions)]
                             //println!("收到消息 {:?}",data.cmd);
 
                             if let Err(e) = conn.handle(data).await {
@@ -212,7 +212,7 @@ impl ServerConnection {
                                     println!("handle {:?} 错误 {}", data, e);
                                 }
                             };
-                            #[cfg(debug_assertions)]
+                            //#[cfg(debug_assertions)]
                             //let data:Data =readbuf[..msglen].into() ;
                             //println!("消息结束 {:?}",data.cmd);
 

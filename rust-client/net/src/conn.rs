@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use openssl::ssl::{Ssl, SslAcceptor};
 
 use static_init::dynamic;
-use std::fmt;
+use std::{fmt, mem};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -370,7 +370,7 @@ where
 }
 
 pub enum Stream {
-    Tcp(Option<TcpStream>),
+    Tcp(TcpStream),
     ServerSsl(tokio_native_tls::TlsStream<TcpStream>),
     #[cfg(feature = "openssl")]
     Openssl(tokio_openssl::SslStream<TcpStream>),
@@ -380,7 +380,7 @@ pub enum Stream {
 impl Stream {
     pub async fn write_all(&mut self, src: &[u8]) -> Result<(), NetError> {
         match self {
-            Stream::Tcp(Some(s)) => Ok(s.write_all(src).await?),
+            Stream::Tcp(s) => Ok(s.write_all(src).await?),
             Stream::ServerSsl(s) => Ok(s.write_all(src).await?),
             #[cfg(feature = "openssl")]
             Stream::Openssl(s) => Ok(s.write_all(src).await?),
@@ -389,7 +389,7 @@ impl Stream {
     }
     pub async fn read(&mut self, buf: &mut [u8]) -> Result<usize, NetError> {
         match self {
-            Stream::Tcp(Some(s)) => Ok(s.read(buf).await?),
+            Stream::Tcp(s) => Ok(s.read(buf).await?),
             Stream::ServerSsl(s) => Ok(s.read(buf).await?),
             #[cfg(feature = "openssl")]
             Stream::Openssl(s) => Ok(s.read(buf).await?),
@@ -398,11 +398,15 @@ impl Stream {
     }
     pub async fn read_exact(&mut self, buf: &mut [u8]) -> Result<usize, NetError> {
         match self {
-            Stream::Tcp(Some(s)) => Ok(s.read_exact(buf).await?),
+            Stream::Tcp(s) => Ok(s.read_exact(buf).await?),
             Stream::ServerSsl(s) => Ok(s.read_exact(buf).await?),
+            #[cfg(feature = "openssl")]
+            Stream::Openssl(s) => Ok(s.read_exact(buf).await?),
             _ => Err(NetError::Custom("不支持的操作".to_string())),
         }
     }
+
+
 }
 
 pub struct TcpConnBase {
@@ -421,8 +425,8 @@ impl TcpConnBase {
     }
     pub fn new(addr: SocketAddr, stream: TcpStream) -> Self {
         Self {
-            addr: addr,
-            stream: Stream::Tcp(Some(stream)),
+            addr,
+            stream: Stream::Tcp(stream),
             readbuf: MsgBufferStatic::new().into(),
             writebuf: MsgBufferStatic::new().into(),
             readtimeout: Duration::from_secs(60),
@@ -550,26 +554,31 @@ impl TcpConnBase {
     pub fn addr(&self) -> SocketAddr {
         self.addr
     }
+    fn take_stream(&mut self)->Stream {
+       mem::replace(&mut self.stream, Stream::None)
+    }
     pub async fn upgrade_ssl(&mut self, acceptor: Arc<TlsAcceptor>) -> Result<(), NetError> {
-        if let Stream::Tcp(tcp_stream) = &mut self.stream {
-            let stream = tcp_stream.take().unwrap();
-            let tls_stream = acceptor.accept(stream).await?;
+        if let Stream::Tcp(tcp_stream) = self.take_stream() {
+            let tls_stream = acceptor.accept(tcp_stream).await?;
             self.stream = Stream::ServerSsl(tls_stream);
-        };
+        }else {
+            return Err(NetError::Tls("It can only be upgraded from TcpStream to SSL".to_string()))
+        }
         Ok(())
     }
     #[cfg(feature = "openssl")]
     pub async fn upgrade_openssl(&mut self, acceptor: Arc<SslAcceptor>) -> Result<(), NetError> {
-        if let Stream::Tcp(tcp_stream) = &mut self.stream {
-            let stream = tcp_stream.take().unwrap();
+        if let Stream::Tcp(tcp_stream) = self.take_stream() {
             let ssl = Ssl::new(acceptor.context()).unwrap();
-            let mut stream = SslStream::new(ssl, stream).unwrap();
+            let mut stream = SslStream::new(ssl, tcp_stream).unwrap();
             Pin::new(&mut stream)
                 .accept()
                 .await
                 .or_else(|e| Err(NetError::Tls(e.to_string())))?;
             self.stream = Stream::Openssl(stream);
-        };
+        }else {
+            return Err(NetError::Tls("It can only be upgraded from TcpStream to SSL".to_string()))
+        }
         Ok(())
     }
 }
