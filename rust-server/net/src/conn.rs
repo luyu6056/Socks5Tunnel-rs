@@ -1,5 +1,4 @@
 use crate::afterfunc::AfterFn;
-use crate::buffer::MsgBufferStatic;
 use crate::AsyncWriteExt;
 use crate::Duration;
 use crate::Instant;
@@ -9,7 +8,7 @@ use ::tokio::macros::support::Poll::{Pending, Ready};
 use async_trait::async_trait;
 use openssl::ssl::{Ssl, SslAcceptor};
 use static_init::dynamic;
-use std::fmt;
+use std::{fmt, mem};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -23,6 +22,7 @@ use tokio::time;
 use tokio::time::timeout_at;
 use tokio_native_tls::TlsAcceptor;
 use tokio_openssl::SslStream;
+use crate::buffer::MsgBuffer;
 
 pub type ConnAsyncFn<T> =
     Box<dyn for<'a> FnOnce(&'a mut T) -> ConnAsyncResult<'a> + Send + Sync + 'static>;
@@ -223,7 +223,7 @@ impl<T> TcpConn<T> {
     pub fn get_inner(&mut self) -> &mut TcpConnBase {
         &mut self.inner
     }
-    pub fn reset_buffer(&self) {
+    pub fn reset_buffer(&mut self) {
         self.inner.readbuf.reset();
     }
 }
@@ -366,7 +366,7 @@ where
 }
 
 pub enum Stream {
-    Tcp(Option<TcpStream>),
+    Tcp(TcpStream),
     ServerSsl(tokio_native_tls::TlsStream<TcpStream>),
     Openssl(tokio_openssl::SslStream<TcpStream>),
     None,
@@ -375,7 +375,7 @@ pub enum Stream {
 impl Stream {
     pub async fn write_all(&mut self, src: &[u8]) -> Result<(), NetError> {
         match self {
-            Stream::Tcp(Some(s)) => Ok(s.write_all(src).await?),
+            Stream::Tcp(s) => Ok(s.write_all(src).await?),
             Stream::ServerSsl(s) => Ok(s.write_all(src).await?),
             Stream::Openssl(s) => Ok(s.write_all(src).await?),
             _ => Err(NetError::Custom("write_all 不支持的操作".to_string())),
@@ -383,7 +383,7 @@ impl Stream {
     }
     pub async fn read(&mut self, buf: &mut [u8]) -> Result<usize, NetError> {
         match self {
-            Stream::Tcp(Some(s)) => Ok(s.read(buf).await?),
+            Stream::Tcp(s) => Ok(s.read(buf).await?),
             Stream::ServerSsl(s) => Ok(s.read(buf).await?),
             Stream::Openssl(s) => Ok(s.read(buf).await?),
             _ => Err(NetError::Custom("read 不支持的操作".to_string())),
@@ -391,8 +391,9 @@ impl Stream {
     }
     pub async fn read_exact(&mut self, buf: &mut [u8]) -> Result<usize, NetError> {
         match self {
-            Stream::Tcp(Some(s)) => Ok(s.read_exact(buf).await?),
+            Stream::Tcp(s) => Ok(s.read_exact(buf).await?),
             Stream::ServerSsl(s) => Ok(s.read_exact(buf).await?),
+            Stream::Openssl(s) => Ok(s.read_exact(buf).await?),
             _ => Err(NetError::Custom("不支持的操作".to_string())),
         }
     }
@@ -401,23 +402,23 @@ impl Stream {
 pub struct TcpConnBase {
     addr: SocketAddr,
     stream: Stream,
-    pub(crate) readbuf: MsgBufferStatic,
-    pub(crate) writebuf: MsgBufferStatic,
+    pub(crate) readbuf: MsgBuffer,
+    pub(crate) writebuf: MsgBuffer,
     readtimeout: Duration,
     max_package_size: usize,
     react_tx: Option<Sender<ReactOperationChannel>>,
 }
 impl TcpConnBase {
-    pub fn set_buf(&self, b: &[u8]) {
+    pub fn set_buf(&mut self, b: &[u8]) {
         self.readbuf.reset();
         self.readbuf.write(b);
     }
     pub fn new(addr: SocketAddr, stream: TcpStream) -> Self {
         Self {
-            addr: addr,
-            stream: Stream::Tcp(Some(stream)),
-            readbuf: MsgBufferStatic::new().into(),
-            writebuf: MsgBufferStatic::new().into(),
+            addr,
+            stream: Stream::Tcp(stream),
+            readbuf: MsgBuffer::new(),
+            writebuf: MsgBuffer::new(),
             readtimeout: Duration::from_secs(60),
             max_package_size: 0,
             react_tx: None,
@@ -503,11 +504,11 @@ impl TcpConnBase {
     pub fn buffer_data(&self) -> &[u8] {
         self.readbuf.as_slice()
     }
-    pub fn buffer_next(&self) -> Option<u8> {
-        unsafe { (*self.readbuf.ptr).next() }
+    pub fn buffer_next(&mut self) -> Option<u8> {
+        self.readbuf.next()
     }
-    pub fn buffer_nth(&self, u: usize) -> Option<u8> {
-        unsafe { (*self.readbuf.ptr).nth(u) }
+    pub fn buffer_nth(&mut self, u: usize) -> Option<u8> {
+        self.readbuf.nth(u)
     }
     pub async fn readline(&self) -> Result<String, NetError> {
         Err(NetError::Custom("readline未处理".to_string()))
@@ -534,34 +535,39 @@ impl TcpConnBase {
     pub fn buffer_len(&self) -> usize {
         self.readbuf.len()
     }
-    pub fn buffer_clear(&self) {
+    pub fn buffer_clear(&mut self) {
         self.readbuf.reset();
     }
-    pub fn reset_buffer(&self) {
+    pub fn reset_buffer(&mut self) {
         self.readbuf.reset();
     }
     pub fn addr(&self) -> SocketAddr {
         self.addr
     }
+    fn take_stream(&mut self)->Stream {
+       mem::replace(&mut self.stream, Stream::None)
+    }
     pub async fn upgrade_ssl(&mut self, acceptor: Arc<TlsAcceptor>) -> Result<(), NetError> {
-        if let Stream::Tcp(tcp_stream) = &mut self.stream {
-            let stream = tcp_stream.take().unwrap();
-            let tls_stream = acceptor.accept(stream).await?;
+        if let Stream::Tcp(tcp_stream) = self.take_stream() {
+            let tls_stream = acceptor.accept(tcp_stream).await?;
             self.stream = Stream::ServerSsl(tls_stream);
-        };
+        }else {
+            return Err(NetError::Tls("It can only be upgraded from TcpStream to SSL".to_string()))
+        }
         Ok(())
     }
     pub async fn upgrade_openssl(&mut self, acceptor: Arc<SslAcceptor>) -> Result<(), NetError> {
-        if let Stream::Tcp(tcp_stream) = &mut self.stream {
-            let stream = tcp_stream.take().unwrap();
+        if let Stream::Tcp(tcp_stream) = self.take_stream() {
             let ssl = Ssl::new(acceptor.context()).unwrap();
-            let mut stream = SslStream::new(ssl, stream).unwrap();
+            let mut stream = SslStream::new(ssl, tcp_stream).unwrap();
             Pin::new(&mut stream)
                 .accept()
                 .await
                 .or_else(|e| Err(NetError::Tls(e.to_string())))?;
             self.stream = Stream::Openssl(stream);
-        };
+        }else {
+            return Err(NetError::Tls("It can only be upgraded from TcpStream to SSL".to_string()))
+        }
         Ok(())
     }
 }

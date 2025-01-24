@@ -275,6 +275,7 @@ impl Agent for ServerAgent {
                 }));
                 conn.client.fd_m.lock().await.insert(data.fd, conn.clone());
                 tokio::spawn(async move {
+                    println!("connect addr {}",addr);
                     match TcpStream::connect(addr.clone()).await {
                         Ok(mut netconn) => {
                             if !conn.is_close.load(Ordering::Relaxed) {
@@ -294,6 +295,7 @@ impl Agent for ServerAgent {
                                     };
                                     #[cfg(debug_assertions)]
                                     println!("{:?} 网站连接断开", conn.fd);
+
                                 });
                                 while let Some(b) = rx.recv().await {
                                     if let Some(b) = b {
@@ -310,8 +312,8 @@ impl Agent for ServerAgent {
                                 let _ = netconn.shutdown().await;
                             }
                         }
-                        Err(_) => {
-                            conn.close("fd拨号失败").await;
+                        Err(e) => {
+                            conn.close(format!("fd拨号失败,addr: {} err: {}",addr,e.to_string())).await;
 
                             return;
                         }
@@ -637,6 +639,7 @@ impl Conn {
                             println!("{:?}", res)
                         }
                     }
+
                 });
             }
         }

@@ -6,15 +6,15 @@ use tokio::sync::mpsc::{*};
 
 pub struct AsyncWaitGroup{
     work_num: Arc<AtomicIsize>,
-    wait_tx:Sender<()>,
-    wait_rx:Receiver<()>,
+    wait_tx:UnboundedSender<()>,
+    wait_rx:UnboundedReceiver<()>,
 }
 pub struct AsyncWaitGroupCopy{
-    wait_tx:Sender<()>,
+    wait_tx:UnboundedSender<()>,
 }
 impl AsyncWaitGroup{
     pub fn new()->Self{
-        let (tx,rx)=channel(100);
+        let (tx,rx)=unbounded_channel();
         AsyncWaitGroup{
             work_num:Arc::new(AtomicIsize::new(0)),
             wait_tx:tx,
@@ -42,6 +42,6 @@ impl AsyncWaitGroup{
 }
 impl AsyncWaitGroupCopy{
     pub async fn done(&self){
-        let _=self.wait_tx.send(()).await;
+        let _=self.wait_tx.send(());
     }
 }

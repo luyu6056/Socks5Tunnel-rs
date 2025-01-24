@@ -116,7 +116,7 @@ impl Agent for Socks5Agent {
                         for v in &data[4..7] {
                             buf.write_string((v.to_string() + ".").as_str());
                         }
-                        buf.write_string((data[8].to_string() + ":").as_ref());
+                        buf.write_string((data[8].to_string()).as_ref());
                         buf.write(&data[data.len() - 2..]);
                         self.getfd(buf.as_slice()).await?;
                         self.auth = SocksAuth::Message;
@@ -187,13 +187,20 @@ impl Agent for Socks5Agent {
         _conn: &mut TcpConn<Self>,
         reasion: Option<String>,
     ) -> Result<(), NetError> {
-        if let Some(socks5conn) = self.conn.as_ref() {
-            let mut fd_m = FD_M.lock().await;
-            fd_m.remove(&socks5conn.fd);
-            socks5conn
-                .operation_tx
-                .try_send(Socks5Operation::Exit(reasion)).map_err(|e|NetError::Channel(e.to_string()))?;
+        if let Some(tx)=self.tx.as_ref(){
+            let tx=tx.clone();
+            if let Some(socks5conn) = self.conn.as_ref() {
+                let _ = socks5conn.operation_tx.try_send(Socks5Operation::Exit(reasion));
+                FD_M.lock().await.remove(&socks5conn.fd);
+                tx.tx.send(ReactOperation::SendData(OperationData{
+                    cmd: Cmd::DeleteFd,
+                    fd: u16_to_fd(socks5conn.fd),
+                    body: vec![],
+                    timestamp: None,
+                })).await.unwrap();
+            }
         }
+
 
         Ok(())
     }

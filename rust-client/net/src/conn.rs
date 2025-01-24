@@ -1,5 +1,4 @@
 use crate::afterfunc::AfterFn;
-use crate::buffer::MsgBufferStatic;
 use crate::AsyncWriteExt;
 use crate::Duration;
 use crate::Instant;
@@ -7,9 +6,7 @@ use crate::NetError;
 use crate::{Receiver, Sender};
 use ::tokio::macros::support::Poll::{Pending, Ready};
 use async_trait::async_trait;
-#[cfg(feature = "openssl")]
 use openssl::ssl::{Ssl, SslAcceptor};
-
 use static_init::dynamic;
 use std::{fmt, mem};
 use std::future::Future;
@@ -24,8 +21,8 @@ use tokio::sync::Mutex;
 use tokio::time;
 use tokio::time::timeout_at;
 use tokio_native_tls::TlsAcceptor;
-#[cfg(feature = "openssl")]
 use tokio_openssl::SslStream;
+use crate::buffer::MsgBuffer;
 
 pub type ConnAsyncFn<T> =
     Box<dyn for<'a> FnOnce(&'a mut T) -> ConnAsyncResult<'a> + Send + Sync + 'static>;
@@ -199,7 +196,7 @@ impl<T> TcpConn<T> {
     //})});
     pub async fn after_fn<F>(&mut self, delay: time::Duration, f: F)
     where
-        F: for<'b> FnOnce(&'b mut T) -> ConnAsyncResult<'b> + Send + Sync + 'static,
+        F: for<'b> FnOnce(&'b mut T,&'b mut TcpConn<T>) -> ConnAsyncResult<'b> + Send + Sync + 'static,
     {
         self.after_fn.lock().await.add_fn(self.addr(), delay, f);
     }
@@ -226,7 +223,7 @@ impl<T> TcpConn<T> {
     pub fn get_inner(&mut self) -> &mut TcpConnBase {
         &mut self.inner
     }
-    pub fn reset_buffer(&self) {
+    pub fn reset_buffer(&mut self) {
         self.inner.readbuf.reset();
     }
 }
@@ -352,7 +349,7 @@ where
                             }
                             ReactOperation::Afterfn(id) => {
                                 if let Some(f) = after_fn.lock().await.remove_task(id) {
-                                    f.call_once((agent,)).await?;
+                                    f.call_once((agent,conn)).await?;
                                 };
                             }
                         }
@@ -362,7 +359,6 @@ where
                 }
             }
         }
-
         //println!("react{:}地址{:}", conn.id, conn.readbuf.ptr.addr());
     }
 
@@ -372,7 +368,6 @@ where
 pub enum Stream {
     Tcp(TcpStream),
     ServerSsl(tokio_native_tls::TlsStream<TcpStream>),
-    #[cfg(feature = "openssl")]
     Openssl(tokio_openssl::SslStream<TcpStream>),
     None,
 }
@@ -382,7 +377,6 @@ impl Stream {
         match self {
             Stream::Tcp(s) => Ok(s.write_all(src).await?),
             Stream::ServerSsl(s) => Ok(s.write_all(src).await?),
-            #[cfg(feature = "openssl")]
             Stream::Openssl(s) => Ok(s.write_all(src).await?),
             _ => Err(NetError::Custom("write_all 不支持的操作".to_string())),
         }
@@ -391,7 +385,6 @@ impl Stream {
         match self {
             Stream::Tcp(s) => Ok(s.read(buf).await?),
             Stream::ServerSsl(s) => Ok(s.read(buf).await?),
-            #[cfg(feature = "openssl")]
             Stream::Openssl(s) => Ok(s.read(buf).await?),
             _ => Err(NetError::Custom("read 不支持的操作".to_string())),
         }
@@ -400,26 +393,23 @@ impl Stream {
         match self {
             Stream::Tcp(s) => Ok(s.read_exact(buf).await?),
             Stream::ServerSsl(s) => Ok(s.read_exact(buf).await?),
-            #[cfg(feature = "openssl")]
             Stream::Openssl(s) => Ok(s.read_exact(buf).await?),
             _ => Err(NetError::Custom("不支持的操作".to_string())),
         }
     }
-
-
 }
 
 pub struct TcpConnBase {
     addr: SocketAddr,
     stream: Stream,
-    pub(crate) readbuf: MsgBufferStatic,
-    pub(crate) writebuf: MsgBufferStatic,
+    pub(crate) readbuf: MsgBuffer,
+    pub(crate) writebuf: MsgBuffer,
     readtimeout: Duration,
     max_package_size: usize,
     react_tx: Option<Sender<ReactOperationChannel>>,
 }
 impl TcpConnBase {
-    pub fn set_buf(&self, b: &[u8]) {
+    pub fn set_buf(&mut self, b: &[u8]) {
         self.readbuf.reset();
         self.readbuf.write(b);
     }
@@ -427,8 +417,8 @@ impl TcpConnBase {
         Self {
             addr,
             stream: Stream::Tcp(stream),
-            readbuf: MsgBufferStatic::new().into(),
-            writebuf: MsgBufferStatic::new().into(),
+            readbuf: MsgBuffer::new(),
+            writebuf: MsgBuffer::new(),
             readtimeout: Duration::from_secs(60),
             max_package_size: 0,
             react_tx: None,
@@ -514,11 +504,11 @@ impl TcpConnBase {
     pub fn buffer_data(&self) -> &[u8] {
         self.readbuf.as_slice()
     }
-    pub fn buffer_next(&self) -> Option<u8> {
-        unsafe { (*self.readbuf.ptr).next() }
+    pub fn buffer_next(&mut self) -> Option<u8> {
+        self.readbuf.next()
     }
-    pub fn buffer_nth(&self, u: usize) -> Option<u8> {
-        unsafe { (*self.readbuf.ptr).nth(u) }
+    pub fn buffer_nth(&mut self, u: usize) -> Option<u8> {
+        self.readbuf.nth(u)
     }
     pub async fn readline(&self) -> Result<String, NetError> {
         Err(NetError::Custom("readline未处理".to_string()))
@@ -545,10 +535,10 @@ impl TcpConnBase {
     pub fn buffer_len(&self) -> usize {
         self.readbuf.len()
     }
-    pub fn buffer_clear(&self) {
+    pub fn buffer_clear(&mut self) {
         self.readbuf.reset();
     }
-    pub fn reset_buffer(&self) {
+    pub fn reset_buffer(&mut self) {
         self.readbuf.reset();
     }
     pub fn addr(&self) -> SocketAddr {
@@ -566,7 +556,6 @@ impl TcpConnBase {
         }
         Ok(())
     }
-    #[cfg(feature = "openssl")]
     pub async fn upgrade_openssl(&mut self, acceptor: Arc<SslAcceptor>) -> Result<(), NetError> {
         if let Stream::Tcp(tcp_stream) = self.take_stream() {
             let ssl = Ssl::new(acceptor.context()).unwrap();

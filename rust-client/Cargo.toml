@@ -16,6 +16,9 @@ chrono = "0.4.39"
 chrono-tz = "0.10.1"
 static_init = "1.0.3"
 fastrand = "2.3.0"
+
+
+
 [profile.release]
 opt-level = "z"       # 优化代码尺寸
 lto = true            # 启用链接时优化 (Link Time Optimization)

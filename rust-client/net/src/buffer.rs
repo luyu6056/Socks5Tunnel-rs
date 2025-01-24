@@ -8,22 +8,14 @@ const TEST_DEFAULT_BUF_SIZE: usize = 1 * 8; //初始化大小
 pub(crate) const MAX_BUF_SIZE: usize = 1024 * 64; //清理失效数据阈值
 pub(crate) const DEFAULT_BUF_SIZE: usize = 1024 * 8; //初始化大小
 
+use std::borrow::Cow;
 use std::fmt;
 use std::marker::PhantomPinned;
 use std::ops::{Index, Range, RangeFrom, RangeTo};
 use std::pin::Pin;
 
-pub struct MsgBufferStatic {
-    inner: Pin<Box<MsgBuffer>>,
-    pub(crate) ptr: *mut MsgBuffer,
-}
-impl Drop for MsgBufferStatic {
-    fn drop(&mut self) {
-        //POOL.put(self)
-    }
-}
-unsafe impl Send for MsgBufferStatic {}
-unsafe impl Sync for MsgBufferStatic {}
+
+
 
 /*impl MsgBufferPoolStatic {
     fn new()->Arc<Pin<Box<MsgBufferPoolStatic>>>{
@@ -267,11 +259,7 @@ impl Default for MsgBuffer {
     }
 }
 
-impl fmt::Display for MsgBufferStatic {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, " {} - {}", self.inner.pos, self.inner.l)
-    }
-}
+
 impl MsgBuffer {
     pub fn new() -> MsgBuffer {
         let v: Vec<u8> = vec![0; DEFAULT_BUF_SIZE];
@@ -373,8 +361,8 @@ impl MsgBuffer {
         }
         return &mut self.b[self.l..newlen];
     }
-    pub fn string(&self) -> String {
-        unsafe { return String::from_utf8_unchecked(self.bytes().to_vec()) }
+    pub fn string(&self) -> Cow<str> {
+        String::from_utf8_lossy(self.bytes())
     }
     //重新整理内存
     fn re_size(&mut self) {
@@ -582,101 +570,7 @@ impl std::io::Write for MsgBuffer {
         Ok(())
     }
 }
-impl MsgBufferStatic {
-    pub fn new() -> MsgBufferStatic {
-        let inner = MsgBuffer::new();
-        let mut buf = MsgBufferStatic {
-            inner: Box::pin(inner),
-            ptr: std::ptr::null_mut(),
-        };
-        unsafe {
-            buf.ptr = buf.inner.as_mut().get_unchecked_mut();
-        }
-        buf
-    }
-    pub fn print(&self) {
-        println!("{:}", self);
-    }
-    pub fn spare(&self, l: usize) -> &mut [u8] {
-        unsafe { (*self.ptr).spare(l) }
-    }
-    pub fn len(&self) -> usize {
-        unsafe { (*self.ptr).len() }
-    }
-    pub fn truncate(&self, len: usize) {
-        unsafe { (*self.ptr).truncate(len) }
-    }
-    pub fn as_slice(&self) -> &[u8] {
-        unsafe { (*self.ptr).as_slice() }
-    }
-    pub fn shift(&self, len: usize) {
-        unsafe { (*self.ptr).shift(len) }
-    }
-    pub fn reset(&self) {
-        unsafe { (*self.ptr).reset() }
-    }
-    pub(crate) fn write(&self, b: &[u8]) {
-        unsafe { (*self.ptr).write(b) }
-    }
-    /*pub fn new() -> MsgBuffer {
 
-    }
-    pub fn new_with_param(default_buf_size:usize,max_buf_size:usize) -> MsgBuffer {
-
-    }
-
-
-    fn grow(&mut self, n: usize) {
-
-    }
-    pub fn reset(&mut self) {
-
-    }
-
-    pub fn make(&mut self, l: usize) -> &mut [u8] {
-
-    }
-
-    pub fn string(&self)->String{
-
-
-    }
-    //重新整理内存
-    fn re_size(&mut self) {
-
-    }
-
-    pub fn write(&mut self, b: &[u8]) {
-
-    }
-
-    pub fn len(&self) -> usize {
-
-    }
-
-
-    pub fn as_mut_slice(&mut self) -> &mut [u8] {
-
-
-
-    }
-    pub fn bytes(&self) -> &[u8] {
-
-
-
-    }
-    pub fn write_string(&mut self, s: &str) {
-
-    }
-    pub fn write_byte(&mut self, s: u8) {
-
-
-
-    }
-    pub fn truncate(&mut self, len: usize) {
-
-    }*/
-}
 #[cfg(test)]
 mod tests {
     use super::*;
