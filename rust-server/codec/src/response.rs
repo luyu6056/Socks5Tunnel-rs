@@ -3,24 +3,43 @@ use crate::http1::ContentLen;
 
 use net::conn::TcpConn;
 const CONTENT_TYPE: &str = "Content-Type";
-#[derive(Debug, Clone)]
+
 pub enum ResponseBody {
     Empty,
-    Body(Vec<u8>),
+    Vec(Vec<u8>),
+    Body(Box<dyn Body>),
 }
 impl ResponseBody {
     fn len(&self) -> Result<usize> {
         match self {
             ResponseBody::Empty => Ok(0),
-            ResponseBody::Body(b) => Ok(b.len()),
+            ResponseBody::Vec(b) => Ok(b.len()),
+            ResponseBody::Body(b) => b.len(),
         }
     }
-    fn bytes(&self) -> Result<&[u8]> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
         match self {
             ResponseBody::Empty => Err(HttpError::IoError("ResponseBody is empty".into()).into()),
-            ResponseBody::Body(b) => Ok(b.as_slice()),
+            ResponseBody::Vec(b) => {
+                if buf.len() >= b.len() {
+                    buf[..b.len()].copy_from_slice(b);
+                    let len = b.len();
+                    b.clear();
+                    return Ok(len);
+                } else {
+                    let s = b.split_off(buf.len());
+                    buf.copy_from_slice(b);
+                    *self = ResponseBody::Vec(s);
+                    return Ok(buf.len());
+                }
+            }
+            ResponseBody::Body(b) => b.read(buf),
         }
     }
+}
+pub trait Body: Send {
+    fn len(&self) -> Result<usize>;
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize>;
 }
 #[allow(dead_code)]
 pub struct Response {
@@ -35,6 +54,7 @@ pub struct Response {
     body: ResponseBody,
 }
 use crate::Result;
+use net::err::NetError;
 use std::collections::HashMap;
 use std::{fmt, usize};
 
@@ -146,10 +166,19 @@ impl Response {
         let data = body.into().into_bytes();
         Ok(Self {
             content_length: ContentLen::Length(data.len().clone()),
-            code: 0,
+            code: 200,
             headers: Default::default(),
             is_nocache: false,
-            body: ResponseBody::Body(data),
+            body: ResponseBody::Vec(data),
+        })
+    }
+    pub fn from_body(body: Box<dyn Body>) -> Result<Self> {
+        Ok(Self {
+            content_length: ContentLen::Length(body.len()?),
+            code: 200,
+            headers: Default::default(),
+            is_nocache: false,
+            body: ResponseBody::Body(body),
         })
     }
     pub fn from_html(html: impl AsRef<str>) -> Result<Self> {
@@ -160,7 +189,7 @@ impl Response {
             headers,
             code: 200,
             content_length: ContentLen::Length(data.len().clone()),
-            body: ResponseBody::Body(data),
+            body: ResponseBody::Vec(data),
             is_nocache: false,
         })
     }
@@ -170,7 +199,7 @@ impl Response {
         headers.insert(CONTENT_TYPE.into(), "text/html; charset=UTF-8".into());
         Ok(Self {
             content_length: ContentLen::Length(data.len().clone()),
-            body: ResponseBody::Body(data),
+            body: ResponseBody::Vec(data),
             code: status,
             headers: headers,
             is_nocache: false,
@@ -180,17 +209,18 @@ impl Response {
         let data = data.into();
         Ok(Self {
             content_length: ContentLen::Length(data.len().clone()),
-            body: ResponseBody::Body(data),
+            body: ResponseBody::Vec(data),
             code: 200,
             headers: Default::default(),
             is_nocache: false,
         })
     }
-    pub(crate) async fn write<T>(self, conn: &mut TcpConn<T>, keep_alive: bool) -> Result<()> {
+    pub(crate) async fn write<T>(mut self, conn: &mut TcpConn<T>, keep_alive: bool) -> Result<()> {
         if self.code == 0 {
             conn.buffer_write(crate::http1::http1code(200)?).await?;
         } else {
-            conn.buffer_write(crate::http1::http1code(self.code)?).await?;
+            conn.buffer_write(crate::http1::http1code(self.code)?)
+                .await?;
         }
 
         if self.is_nocache {
@@ -225,25 +255,11 @@ impl Response {
         conn.buffer_write(&size.to_string().as_bytes()).await?;
         if size > 0 {
             conn.buffer_write(b"\r\n\r\n").await?;
-            conn.buffer_write(self.body.bytes()?).await?;
-            /*for msglen := r.dataSize; msglen > 0; msglen = r.dataSize {
-                if msglen > http2initialMaxFrameSize*100-r.out.Len() { //切分为一个tls包
-                    msglen = http2initialMaxFrameSize*100 - r.out.Len()
-                }
-                if _, e := r.data.Read(r.out.Make(msglen)); e != nil {
-                    DebugLog("httpsfinish Read错误%v", e)
-                    r.hs.Close()
-                    return
-                }
-                if r.dataSize > msglen {
-                    r.hs.flushWrite(r.out.Bytes())
-                } else {
-                    r.hs.write(r.out.Bytes())
-                }
-
-                r.out.Reset()
-                r.dataSize -= msglen
-            }*/
+            let mut data = [0; 163840];
+            while self.body.len()? > 0 {
+                let n = self.body.read(&mut data)?;
+                conn.buffer_write(&data[..n]).await?;
+            }
         } else {
             conn.buffer_write(b"\r\n\r\n").await?;
         }

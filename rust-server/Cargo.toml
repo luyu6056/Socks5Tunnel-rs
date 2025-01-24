@@ -21,12 +21,13 @@ openssl = "0.10.68"
 tokio-openssl = "0.6.5"
 
 
+
 [profile.dev]
-opt-level = "z"       # 优化代码尺寸
+opt-level = "z"
 
 [profile.release]
-opt-level = 3       # 优化代码尺寸
-lto = true            # 启用链接时优化 (Link Time Optimization)
-codegen-units = 1     # 降低代码生成单元数，增加优化时间但减少二进制大小
-panic = "abort"       # 使用 'abort' 而不是 'unwind' 来处理 panic
-strip = "debuginfo"   # 移除调试信息
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "debuginfo"

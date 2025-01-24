@@ -53,6 +53,7 @@ impl<T: Clone + Send + 'static> Agent for Http1Agent<T> {
                     .write(conn, keep_alive)
                     .await?;
             };
+
             return Ok(true);
         }
         return Ok(false);

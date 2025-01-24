@@ -4,7 +4,7 @@ use crate::cmd::Cmd;
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
 use codec::http1::Request;
 use codec::http1example::Http1Agent;
-use codec::response::Response;
+use codec::response::{Body, Response};
 use codec::router::Router;
 use dns_lookup::lookup_addr;
 use net::afterfunc::ConnAsyncResult;
@@ -19,6 +19,7 @@ use static_init::dynamic;
 use std::collections::HashMap;
 use std::iter::repeat_with;
 use std::net::IpAddr;
+use std::slice;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::*;
@@ -28,8 +29,11 @@ use tokio::net::TcpStream;
 use tokio::net::tcp::OwnedReadHalf;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::*;
-use tokio::time::{Instant, timeout, timeout_at};
+use tokio::time::{Instant, timeout, timeout_at, sleep};
 use tokio_native_tls::native_tls::Identity;
+
+
+
 
 mod cmd;
 pub mod utils;
@@ -51,6 +55,7 @@ struct Data<'a> {
     body: &'a [u8],
     timestamp: Option<i64>,
 }
+
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
@@ -115,20 +120,35 @@ async fn get_ip(req: Request, _: ()) -> Result<Response, NetError> {
     Response::from_html(format!(r#"{{"processedString":"{}"}}"#, req.remote_addr()))
 }
 async fn garbage(_req: Request, _: ()) -> Result<Response, NetError> {
-    unsafe {
-        let vec_u64: Vec<u64> = repeat_with(|| fastrand::u64(..))
-            .take(1024 * 1024 * 10 / 8)
-            .collect();
-        let len = vec_u64.len();
-        let ptr = vec_u64.as_ptr() as *mut u8;
-        let capacity = vec_u64.capacity() * std::mem::size_of::<u64>();
+    Response::from_body(Box::new(RandGenerator{len:1024*1024*10}))
+}
+struct RandGenerator{
+    len: usize,
+}
+impl Body for RandGenerator {
+    fn len(&self) -> codec::Result<usize> {
+        Ok(self.len)
+    }
 
-        // 从原始指针创建一个新的 Vec<u8>
-        let vec_u8 = Vec::from_raw_parts(ptr, len * 8, capacity);
+    fn read(&mut self, buf: &mut [u8]) -> codec::Result<usize> {
+        unsafe {
+            if buf.len()  > self.len {
+                let outlen=self.len;
+                self.len=0;
+                Ok(outlen)
+            }else {
+                let vec_u64: Vec<u64> = repeat_with(|| fastrand::u64(..))
+                    .take(buf.len() / 8)
+                    .collect();
+                let len = vec_u64.len();
+                let ptr = vec_u64.as_ptr() as *mut u8;
+                let slice: &[u8] = unsafe { slice::from_raw_parts(ptr, len * 8) };
+                buf.copy_from_slice(slice);
+                self.len = self.len- slice.len();
+                Ok(len * 8)
+            }
 
-        // 释放原始的 Vec<u64>，避免内存泄漏
-        std::mem::forget(vec_u64);
-        Response::byte(vec_u8)
+        }
     }
 }
 //---------------非http部分--------------------------------------------------
@@ -229,19 +249,18 @@ impl Agent for ServerAgent {
     }
 
     async fn react(&mut self, tcp_conn: &mut TcpConn<Self>) -> Result<bool, NetError> {
+        #[cfg(debug_assertions)]
         let begen = now();
-        let indata = tcp_conn.buffer_data();
 
+        let indata = tcp_conn.buffer_data();
         let length = (indata[0] as usize) + ((indata[1] as usize) << 8);
         if indata.len() < length {
-
             return Ok(false);
         }
         let indata = indata[..length].to_vec();
         let mut data: Data = indata.as_slice().into();
+        #[cfg(debug_assertions)]
         let cmd = data.cmd.clone();
-        tcp_conn.shift(length).await?;
-        //主逻辑
         #[cfg(debug_assertions)]
         if DEBUG_LEN == 8 {
             println!(
@@ -251,6 +270,8 @@ impl Agent for ServerAgent {
             );
         }
 
+        //主逻辑
+        tcp_conn.shift(length).await?;
         match &data.cmd {
             Cmd::GetFd => {
                 if self.client.is_none() {
@@ -586,7 +607,7 @@ where
     Ok(())
 }
 impl Conn {
-    async fn close(&self, reason: impl Into<String>) {
+    async fn close(&self, _reason: impl Into<String>) {
         if self
             .is_close
             .compare_exchange_weak(false, true, Ordering::SeqCst, Ordering::Relaxed)
@@ -594,7 +615,7 @@ impl Conn {
         {
             let _ = self.write.send(None).await;
             #[cfg(debug_assertions)]
-            println!("conn fd {:?} 关闭了 原因 {}", self.fd, reason.into());
+            println!("conn fd {:?} 关闭了 原因 {}", self.fd, _reason.into());
 
             self.client.fd_m.lock().await.remove(&self.fd);
 
