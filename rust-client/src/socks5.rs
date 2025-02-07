@@ -3,19 +3,14 @@ use net::Agent;
 use net::buffer::MsgBuffer;
 use net::conn::{ConnWriter, TcpConn};
 use net::err::NetError;
-use static_init::dynamic;
-use std::collections::HashMap;
-
-
 use std::sync::Arc;
 use std::sync::atomic::*;
 use std::time::Duration;
-use tokio::sync::Mutex;
+use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::sleep;
 
 const RETRY_NUM: usize = 60;
-#[dynamic]
-pub static FD_M: Arc<Mutex<HashMap<u16, Arc<Socks5Conn>>>> = Arc::new(Mutex::new(HashMap::new()));
+
 #[derive(Clone)]
 pub(crate) struct Socks5Agent {
     pub(crate) conn: Option<Arc<Socks5Conn>>,
@@ -40,7 +35,7 @@ pub struct Socks5Conn {
     remote_status: AtomicBool,
     pub windows_size: AtomicI64, //接收窗口
     write_tx: ConnWriter,
-    pub operation_tx: Sender<Socks5Operation>,
+    pub operation_tx: UnboundedSender<Socks5Operation>,
 }
 unsafe impl Send for Socks5Agent {}
 impl Agent for Socks5Agent {
@@ -50,10 +45,11 @@ impl Agent for Socks5Agent {
             let index = fastrand::usize(0..list.len());
             let tx = list[index].clone();
             if tx.status.load(Ordering::Relaxed) {
-                let mut fd_m = FD_M.lock().await;
+                let fd=tx.fd.clone();
+                let mut fd_m = fd.lock().await;
                 for id in 1..65535u16 {
                     if !fd_m.contains_key(&id) {
-                        let (operation_tx, operation_rx) = tokio::sync::mpsc::channel(1000);
+                        let (operation_tx, operation_rx) = tokio::sync::mpsc::unbounded_channel();
                         let socs5conn = Arc::new(Socks5Conn {
                             fd: id,
                             remote_status: Default::default(),
@@ -114,10 +110,10 @@ impl Agent for Socks5Agent {
                         //ipv4
                         let mut buf = MsgBuffer::new();
                         for v in &data[4..7] {
-                            buf.write_string((v.to_string() + ".").as_str());
+                            buf.write_string((v.to_string() + ".").as_str())?;
                         }
-                        buf.write_string((data[8].to_string()).as_ref());
-                        buf.write(&data[data.len() - 2..]);
+                        buf.write_string((data[8].to_string()).as_ref())?;
+                        buf.write(&data[data.len() - 2..])?;
                         self.getfd(buf.as_slice()).await?;
                         self.auth = SocksAuth::Message;
                         conn.write_byte([5, 0, 0, 1, 0, 0, 0, 0, 0, 0].as_ref())
@@ -190,14 +186,19 @@ impl Agent for Socks5Agent {
         if let Some(tx)=self.tx.as_ref(){
             let tx=tx.clone();
             if let Some(socks5conn) = self.conn.as_ref() {
-                let _ = socks5conn.operation_tx.try_send(Socks5Operation::Exit(reasion));
-                FD_M.lock().await.remove(&socks5conn.fd);
-                tx.tx.send(ReactOperation::SendData(OperationData{
+                let _ = socks5conn.operation_tx.send(Socks5Operation::Exit(reasion));
+                let _ =tx.tx.send(ReactOperation::SendData(OperationData{
                     cmd: Cmd::DeleteFd,
                     fd: u16_to_fd(socks5conn.fd),
                     body: vec![],
                     timestamp: None,
-                })).await.unwrap();
+                }));
+                let fd=socks5conn.fd;
+                tokio::spawn(async move {
+                    //延迟删除，避新的conn使用已过时的fd
+                    tokio::time::sleep(Duration::from_secs(120)).await;
+                    tx.fd.lock().await.remove(&fd);
+                });
             }
         }
 
@@ -230,11 +231,11 @@ impl Socks5Agent {
             .unwrap()
             .tx
             .send(ReactOperation::SendData(data))
-            .await.map_err(|e|NetError::Channel(e.to_string()))?)
+            .map_err(|e|NetError::Channel(e.to_string()))?)
     }
 }
 impl Socks5Conn {
-    async fn handle(&self, mut rx: Receiver<Socks5Operation>) -> Result<(), NetError> {
+    async fn handle(&self, mut rx: UnboundedReceiver<Socks5Operation>) -> Result<(), NetError> {
         while let Some(recv) = rx.recv().await {
             match recv {
                 Socks5Operation::SendData(data) => {

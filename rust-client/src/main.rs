@@ -1,10 +1,11 @@
 extern crate core;
-use tokio::sync::mpsc::{Receiver, Sender};
+
 use crate::cmd::Cmd;
 use net::Server;
 use net::buffer::MsgBuffer;
 use net::err::NetError;
 use static_init::dynamic;
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,12 +14,13 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
+use tokio::sync::mpsc::{Receiver, Sender, UnboundedSender};
 use tokio::time;
-use tokio::time::{sleep};
+use tokio::time::sleep;
 use tokio_native_tls::TlsStream;
 use tokio_native_tls::native_tls::{Identity, TlsConnector};
 mod utils;
-use crate::socks5::{FD_M, Socks5Agent, Socks5Operation, SocksAuth};
+use crate::socks5::{Socks5Agent, Socks5Conn, Socks5Operation, SocksAuth};
 pub use utils::*;
 
 mod cmd;
@@ -35,7 +37,7 @@ const UPDATE_SIZE_LEN: usize = 8;
 //max_len: HEAD_LEN+data.len()
 const MAX_PLAINTEXT: usize = 16384;
 const MAX_SOCKS5MSG_LEN: usize = MAX_PLAINTEXT - HEAD_LEN - UPDATE_SIZE_LEN;
-const WINDOWS_UPDATE_SIZE: i64 = MAX_PLAINTEXT as i64 * 20;
+const WINDOWS_UPDATE_SIZE: i64 = MAX_PLAINTEXT as i64 * 200;
 #[derive(Debug)]
 struct Data<'a> {
     cmd: Cmd,
@@ -51,8 +53,9 @@ pub(crate) struct OperationData {
 }
 #[derive(Clone)]
 pub(crate) struct OperationChannelTx {
-    tx: Sender<ReactOperation>,
+    tx: UnboundedSender<ReactOperation>,
     status: Arc<AtomicBool>,
+    fd: Arc<Mutex<HashMap<u16, Arc<Socks5Conn>>>>,
 }
 pub(crate) enum ReactOperation {
     ReConnect,
@@ -72,7 +75,7 @@ struct ServerConnection {
 #[tokio::main]
 async fn main() {
     fastrand::seed(now().unix_millis() as u64);
-    let  ifs = netdev::get_default_interface().unwrap();
+    let ifs = netdev::get_default_interface().unwrap();
     let mac_addr = hex::encode(&ifs.mac_addr.expect("Mac address not found").octets());
     let cert = include_bytes!(".././config/cert");
     let key = include_bytes!(".././config/pkcs8");
@@ -93,8 +96,7 @@ async fn main() {
         let connector = connector.clone();
         let mac_addr = mac_addr.clone();
         tokio::spawn(async move {
-            ServerConnection::start(ADDR, connector, mac_addr)
-                .await;
+            ServerConnection::start(ADDR, connector, mac_addr).await;
         });
     }
     Server::new()
@@ -113,13 +115,14 @@ impl ServerConnection {
         addr: &str,
         connector: Arc<tokio_native_tls::TlsConnector>,
         mac_addr: String,
-    )  {
-        let (tx, mut rx) = tokio::sync::mpsc::channel(1000);
+    ) {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut conn = ServerConnection {
             addr: addr.to_string(),
             operation_channel_tx: OperationChannelTx {
                 tx,
                 status: Arc::new(Default::default()),
+                fd: Arc::new(Default::default()),
             },
             ping_time: 0,
             pong_time: 0,
@@ -137,10 +140,10 @@ impl ServerConnection {
 
         #[doc(hidden)]
         mod __tokio_select_util {
-            pub(super) enum Out<_0, _1,_2> {
+            pub(super) enum Out<_0, _1, _2> {
                 Read(_0),
                 Op(_1),
-                PingInterval(_2)
+                PingInterval(_2),
             }
         }
         let mut readbuf = MsgBuffer::new();
@@ -177,38 +180,46 @@ impl ServerConnection {
                                 readbuf.reset();
                             }
                             ReactOperation::SendData(data) => {
-                                if let Err(e)=conn.write(Data::from(&data), &mut server_stream).await{
+                                if let Err(e) =
+                                    conn.write(Data::from(&data), &mut server_stream).await
+                                {
                                     #[cfg(debug_assertions)]
-                                    println!("write 错误 {}",e);
+                                    println!("write 错误 {}", e);
 
-                                    conn.operation_channel_tx.tx.send(ReactOperation::ReConnect).await.unwrap();
+                                    conn.operation_channel_tx
+                                        .tx
+                                        .send(ReactOperation::ReConnect)
+                                        .unwrap();
                                 };
                             }
                         }
                     }
                     __tokio_select_util::Out::Read(res) => {
-                        if let Err(e)=res{
+                        if let Err(e) = res {
                             #[cfg(debug_assertions)]
-                            println!("Read 错误 {}",e);
+                            println!("Read 错误 {}", e);
 
-                            conn.operation_channel_tx.tx.send(ReactOperation::ReConnect).await.unwrap();
+                            conn.operation_channel_tx
+                                .tx
+                                .send(ReactOperation::ReConnect)
+                                .unwrap();
                             continue;
                         };
                         //消息in
-                        while   readbuf.len() > 2 {
-                            let msglen = (readbuf[0] as usize) | (readbuf[1] as usize) << 8;
+                        while readbuf.len() > 2 {
+                            let msglen = (readbuf.0[0] as usize) | (readbuf.0[1] as usize) << 8;
 
                             if readbuf.len() < msglen {
                                 break;
                             }
-                            let data :Data =readbuf[..msglen].into() ;
+                            let data: Data = readbuf.0[..msglen].into();
                             //#[cfg(debug_assertions)]
                             //println!("收到消息 {:?}",data.cmd);
 
                             if let Err(e) = conn.handle(data).await {
                                 #[cfg(debug_assertions)]
                                 {
-                                    let data:Data =readbuf[..msglen].into() ;
+                                    let data: Data = readbuf.0[..msglen].into();
                                     println!("handle {:?} 错误 {}", data, e);
                                 }
                             };
@@ -216,23 +227,34 @@ impl ServerConnection {
                             //let data:Data =readbuf[..msglen].into() ;
                             //println!("消息结束 {:?}",data.cmd);
 
-
                             readbuf.shift(msglen);
                         }
-
-
                     }
-                    __tokio_select_util::Out::PingInterval(_)=>{
+                    __tokio_select_util::Out::PingInterval(_) => {
                         let t = now().unix();
-                        let data=OperationData{
+                        let data = OperationData {
                             cmd: Cmd::Ping,
-                            fd: [0,0],
-                            body: vec![t as u8,(t>>8) as u8, (t>>16) as u8,(t>>24) as u8,(t>>32) as u8,(t>>40) as u8,(t>>48) as u8,(t>>56) as u8],
-                            timestamp:if DEBUG_LEN==8{
+                            fd: [0, 0],
+                            body: vec![
+                                t as u8,
+                                (t >> 8) as u8,
+                                (t >> 16) as u8,
+                                (t >> 24) as u8,
+                                (t >> 32) as u8,
+                                (t >> 40) as u8,
+                                (t >> 48) as u8,
+                                (t >> 56) as u8,
+                            ],
+                            timestamp: if DEBUG_LEN == 8 {
                                 Some(now().unix_millis())
-                            }else { None },
+                            } else {
+                                None
+                            },
                         };
-                        conn.operation_channel_tx.tx.send(ReactOperation::SendData(data)).await.unwrap();
+                        conn.operation_channel_tx
+                            .tx
+                            .send(ReactOperation::SendData(data))
+                            .unwrap();
                     }
                 }
             }
@@ -243,52 +265,69 @@ impl ServerConnection {
 
         match msg.cmd {
             Cmd::DeleteFd => {
-                if let Some(socks5conn) = FD_M.lock().await.get(&fd_to_u16(msg.fd)) {
-                    socks5conn
-                        .operation_tx
-                        .send(Socks5Operation::Exit(Some(
-                            "服务器要求远程关闭".to_string(),
-                        )))
-                        .await.map_err(|e|NetError::Channel(e.to_string()))?;
+                if let Some(socks5conn) = self
+                    .operation_channel_tx
+                    .fd
+                    .lock()
+                    .await
+                    .get(&fd_to_u16(msg.fd))
+                {
+                    //socks5主动close的时候会err
+                    let _ = socks5conn.operation_tx.send(Socks5Operation::Exit(Some(
+                        "服务器要求远程关闭".to_string(),
+                    )));
                 };
             }
             Cmd::Msg => {
-                if let Some(socks5conn) = FD_M.lock().await.get(&fd_to_u16(msg.fd)) {
-                    socks5conn
-                        .operation_tx
-                        .send(Socks5Operation::SendData(msg.body.to_vec()))
-                        .await.map_err(|e|NetError::Channel(e.to_string()))?;
-                    let windows_size = socks5conn
-                        .windows_size
-                        .fetch_add(-1 * (msg.body.len() as i64), Ordering::Relaxed);
-
-                    if windows_size < WINDOWS_UPDATE_SIZE / 2 {
-                        //扩大窗口
-                        let size = WINDOWS_UPDATE_SIZE - windows_size;
-                        socks5conn.windows_size.fetch_add(size, Ordering::Relaxed);
-                        let data = OperationData {
-                            cmd: Cmd::WindowsUpdate,
-                            fd: msg.fd,
-                            body: vec![
-                                size as u8,
-                                (size >> 8) as u8,
-                                (size >> 16) as u8,
-                                (size >> 24) as u8,
-                                (size >> 32) as u8,
-                                (size >> 40) as u8,
-                                (size >> 48) as u8,
-                                (size >> 56) as u8,
-                            ],
-                            timestamp: if DEBUG_LEN==8 {
-                                Some(now().unix_millis())
-                            }else { None },
-                        };
-                        self.operation_channel_tx
-                            .tx
-                            .send(ReactOperation::SendData(data))
-                            .await.map_err(|e|NetError::Channel(e.to_string()))?;
+                let socks5conn = {
+                    match self
+                        .operation_channel_tx
+                        .fd
+                        .lock()
+                        .await
+                        .get(&fd_to_u16(msg.fd))
+                    {
+                        None => return Ok(()),
+                        Some(socks5conn) => socks5conn.clone(),
                     }
                 };
+
+                socks5conn
+                    .operation_tx
+                    .send(Socks5Operation::SendData(msg.body.to_vec()))
+                    .map_err(|e| NetError::Channel(e.to_string()))?;
+                let windows_size = socks5conn
+                    .windows_size
+                    .fetch_add(-1 * (msg.body.len() as i64), Ordering::Relaxed);
+
+                if windows_size < WINDOWS_UPDATE_SIZE / 2 {
+                    //扩大窗口
+                    let size = WINDOWS_UPDATE_SIZE - windows_size;
+                    socks5conn.windows_size.fetch_add(size, Ordering::Relaxed);
+                    let data = OperationData {
+                        cmd: Cmd::WindowsUpdate,
+                        fd: msg.fd,
+                        body: vec![
+                            size as u8,
+                            (size >> 8) as u8,
+                            (size >> 16) as u8,
+                            (size >> 24) as u8,
+                            (size >> 32) as u8,
+                            (size >> 40) as u8,
+                            (size >> 48) as u8,
+                            (size >> 56) as u8,
+                        ],
+                        timestamp: if DEBUG_LEN == 8 {
+                            Some(now().unix_millis())
+                        } else {
+                            None
+                        },
+                    };
+                    self.operation_channel_tx
+                        .tx
+                        .send(ReactOperation::SendData(data))
+                        .map_err(|e| NetError::Channel(e.to_string()))?;
+                }
             }
             Cmd::Pong => {
                 let ping_time = (msg.body[0] as i64)
@@ -310,11 +349,11 @@ impl ServerConnection {
                     self.is_first_delete = true;
                     return Ok(());
                 }
-                let mut fd_m = FD_M.lock().await;
+                let mut fd_m = self.operation_channel_tx.fd.lock().await;
                 for (_, conn) in fd_m.iter() {
                     conn.operation_tx
                         .send(Socks5Operation::Exit(Some("服务器重连删除".to_string())))
-                        .await.map_err(|e|NetError::Channel(e.to_string()))?;
+                        .map_err(|e| NetError::Channel(e.to_string()))?;
                 }
                 fd_m.clear();
             }
@@ -434,7 +473,7 @@ async fn do_read_data(
     readbuf: &mut MsgBuffer,
     stream: &mut TlsStream<TcpStream>,
 ) -> Result<(), NetError> {
-    let buffer = readbuf.spare(8192);
+    let buffer = readbuf.spare(8192)?;
     let size = stream.read(buffer).await?;
     if size == 0 {
         return Err(NetError::TcpDisconnected);
@@ -460,7 +499,7 @@ fn fd_to_u16(fd: [u8; 2]) -> u16 {
 }
 impl<'a> From<&'a [u8]> for Data<'a> {
     fn from(data: &'a [u8]) -> Self {
-        Self{
+        Self {
             cmd: Cmd::try_from(data[2]).unwrap(),
             fd: [data[3], data[4]],
             body: &data[HEAD_LEN..],
@@ -470,10 +509,10 @@ impl<'a> From<&'a [u8]> for Data<'a> {
                         | (data[6] as i64) << 8
                         | (data[7] as i64) << 16
                         | (data[8] as i64) << 24
-                    | (data[9] as i64) << 32
-                    | (data[10] as i64) << 40
-                    | (data[11] as i64) << 48
-                    | (data[12] as i64) << 56,
+                        | (data[9] as i64) << 32
+                        | (data[10] as i64) << 40
+                        | (data[11] as i64) << 48
+                        | (data[12] as i64) << 56,
                 )
             } else {
                 None

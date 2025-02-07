@@ -274,7 +274,7 @@ impl WSconn {
             //	self.WriteControl(CloseMessage, FormatCloseMessage(CloseMessageTooBig, ""), time.Now().Add(writeWait))
             //	return noFrame, ErrReadLimit
             //}
-            self.readbuf.write(payload.as_slice());
+            self.readbuf.write(payload.as_slice())?;
             return Ok(frame_type);
         }
         // 7. Process control frame payload.

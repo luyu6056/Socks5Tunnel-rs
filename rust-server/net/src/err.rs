@@ -49,8 +49,8 @@ pub enum NetError {
 
     #[error("json转化失败 {0}")]
     JsonErr(String),
-#[error("tls 错误 {0}")]
-Tls(String),
+    #[error("tls 错误 {0}")]
+    Tls(String),
 }
 
 impl NetError {
@@ -68,7 +68,6 @@ impl std::convert::From<Elapsed> for NetError {
         NetError::Custom(err.to_string())
     }
 }
-
 
 impl std::convert::From<SystemTimeError> for NetError {
     fn from(err: SystemTimeError) -> Self {
@@ -128,13 +127,18 @@ impl From<tokio_native_tls::native_tls::Error> for NetError {
 }
 
 impl<T> From<tokio::sync::mpsc::error::SendError<T>> for NetError {
-    fn from(err:tokio::sync::mpsc::error::SendError<T>) -> Self {
+    fn from(err: tokio::sync::mpsc::error::SendError<T>) -> Self {
         NetError::Channel(err.to_string())
     }
 }
 
 impl<T> From<tokio::sync::mpsc::error::TrySendError<T>> for NetError {
-    fn from(err:tokio::sync::mpsc::error::TrySendError<T>) -> Self {
+    fn from(err: tokio::sync::mpsc::error::TrySendError<T>) -> Self {
         NetError::Channel(err.to_string())
+    }
+}
+impl From<Box<dyn std::error::Error>> for NetError {
+    fn from(err: Box<dyn std::error::Error>) -> Self {
+        NetError::Custom(err.to_string())
     }
 }

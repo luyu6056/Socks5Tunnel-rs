@@ -19,7 +19,6 @@ use static_init::dynamic;
 use std::collections::HashMap;
 use std::iter::repeat_with;
 use std::net::IpAddr;
-use std::slice;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::*;
@@ -29,11 +28,8 @@ use tokio::net::TcpStream;
 use tokio::net::tcp::OwnedReadHalf;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::*;
-use tokio::time::{Instant, timeout, timeout_at, sleep};
+use tokio::time::{Instant, timeout, timeout_at};
 use tokio_native_tls::native_tls::Identity;
-
-
-
 
 mod cmd;
 pub mod utils;
@@ -46,7 +42,7 @@ const UPDATE_SIZE_LEN: usize = 8;
 //max_len: HEAD_LEN+data.len()
 const MAX_PLAINTEXT: usize = 16384;
 const MAX_SOCKS5MSG_LEN: usize = MAX_PLAINTEXT - HEAD_LEN - UPDATE_SIZE_LEN;
-const WINDOWS_UPDATE_SIZE: i64 = MAX_PLAINTEXT as i64 * 20;
+const WINDOWS_UPDATE_SIZE: i64 = MAX_PLAINTEXT as i64 * 200;
 
 #[derive(Debug)]
 struct Data<'a> {
@@ -55,7 +51,6 @@ struct Data<'a> {
     body: &'a [u8],
     timestamp: Option<i64>,
 }
-
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
@@ -120,9 +115,11 @@ async fn get_ip(req: Request, _: ()) -> Result<Response, NetError> {
     Response::from_html(format!(r#"{{"processedString":"{}"}}"#, req.remote_addr()))
 }
 async fn garbage(_req: Request, _: ()) -> Result<Response, NetError> {
-    Response::from_body(Box::new(RandGenerator{len:1024*1024*10}))
+    Response::from_body(Box::new(RandGenerator {
+        len: 1024 * 1024 * 10,
+    }))
 }
-struct RandGenerator{
+struct RandGenerator {
     len: usize,
 }
 impl Body for RandGenerator {
@@ -131,23 +128,15 @@ impl Body for RandGenerator {
     }
 
     fn read(&mut self, buf: &mut [u8]) -> codec::Result<usize> {
-        unsafe {
-            if buf.len()  > self.len {
-                let outlen=self.len;
-                self.len=0;
-                Ok(outlen)
-            }else {
-                let vec_u64: Vec<u64> = repeat_with(|| fastrand::u64(..))
-                    .take(buf.len() / 8)
-                    .collect();
-                let len = vec_u64.len();
-                let ptr = vec_u64.as_ptr() as *mut u8;
-                let slice: &[u8] = unsafe { slice::from_raw_parts(ptr, len * 8) };
-                buf.copy_from_slice(slice);
-                self.len = self.len- slice.len();
-                Ok(len * 8)
-            }
-
+        if buf.len() > self.len {
+            let outlen = self.len;
+            self.len = 0;
+            Ok(outlen)
+        } else {
+            let vec_u8: Vec<u8> = repeat_with(|| fastrand::u8(..)).take(buf.len()).collect();
+            buf.copy_from_slice(vec_u8.as_slice());
+            self.len = self.len - buf.len();
+            Ok(buf.len())
         }
     }
 }
@@ -214,7 +203,7 @@ impl Agent for ServerAgent {
             |agent: &mut Self, conn: &mut TcpConn<Self>| -> ConnAsyncResult {
                 Box::pin(async move {
                     //握手失败关闭连接
-                    if agent.client.is_none(){
+                    if agent.client.is_none() {
                         conn.close(None::<String>)?;
                     };
                     Ok(())
@@ -224,23 +213,23 @@ impl Agent for ServerAgent {
         .await;
         let mut mysqlbuf = MsgBuffer::new();
         fastrand::seed(utils::now().unix() as u64);
-        mysqlbuf.make(4); //生成4位头
-        mysqlbuf.write_byte(10);
-        mysqlbuf.write_string("5.5.5-10.5.1-MariaDB");
-        mysqlbuf.write_byte(0);
+        mysqlbuf.make(4)?; //生成4位头
+        mysqlbuf.write_byte(10)?;
+        mysqlbuf.write_string("5.5.5-10.5.1-MariaDB")?;
+        mysqlbuf.write_byte(0)?;
         let id = CONNECTION_ID.fetch_add(fastrand::u32(1..=5), Ordering::Relaxed);
 
-        LittleEndian::write_u32(mysqlbuf.make(4), id);
-        let b = mysqlbuf.make(9);
+        LittleEndian::write_u32(mysqlbuf.make(4)?, id);
+        let b = mysqlbuf.make(9)?;
         LittleEndian::write_u64(b, fastrand::u64(..)); //产生个随机数，用于校验//auth-plugin-data-part-1
         b[8] = 0; //[00] filler
-        mysqlbuf.write(CAPABILITY_RESERVED); //
-        let b = mysqlbuf.make(13);
+        mysqlbuf.write(CAPABILITY_RESERVED)?; //
+        let b = mysqlbuf.make(13)?;
         LittleEndian::write_u64(b, fastrand::u64(..)); //挑战随机数的9-16位
         LittleEndian::write_u32(&mut b[8..], fastrand::u32(..)); //挑战随机数的16-20位
         b[12] = 0;
-        mysqlbuf.write_string("mysql_native_password"); //密码套件
-        mysqlbuf.write_byte(0); //结束
+        mysqlbuf.write_string("mysql_native_password")?; //密码套件
+        mysqlbuf.write_byte(0)?; //结束
         let len = mysqlbuf.len();
         LittleEndian::write_u32(&mut mysqlbuf.as_mut_slice()[..4], len as u32 - 4); //写入长度
         conn.write_byte(mysqlbuf.bytes()).await?;
@@ -250,15 +239,15 @@ impl Agent for ServerAgent {
 
     async fn react(&mut self, tcp_conn: &mut TcpConn<Self>) -> Result<bool, NetError> {
         #[cfg(debug_assertions)]
-        let begen = now();
+        let begin = now();
 
-        let indata = tcp_conn.buffer_data();
-        let length = (indata[0] as usize) + ((indata[1] as usize) << 8);
-        if indata.len() < length {
+        let in_data = tcp_conn.buffer_data();
+        let length = (in_data[0] as usize) + ((in_data[1] as usize) << 8);
+        if in_data.len() < length {
             return Ok(false);
         }
-        let indata = indata[..length].to_vec();
-        let mut data: Data = indata.as_slice().into();
+        let in_data = in_data[..length].to_vec();
+        let mut data: Data = in_data.as_slice().into();
         #[cfg(debug_assertions)]
         let cmd = data.cmd.clone();
         #[cfg(debug_assertions)]
@@ -296,7 +285,9 @@ impl Agent for ServerAgent {
                 }));
                 conn.client.fd_m.lock().await.insert(data.fd, conn.clone());
                 tokio::spawn(async move {
-                    println!("connect addr {}",addr);
+                    #[cfg(debug_assertions)]
+                    println!("connect addr {}", addr);
+
                     match TcpStream::connect(addr.clone()).await {
                         Ok(mut netconn) => {
                             if !conn.is_close.load(Ordering::Relaxed) {
@@ -316,7 +307,6 @@ impl Agent for ServerAgent {
                                     };
                                     #[cfg(debug_assertions)]
                                     println!("{:?} 网站连接断开", conn.fd);
-
                                 });
                                 while let Some(b) = rx.recv().await {
                                     if let Some(b) = b {
@@ -334,7 +324,8 @@ impl Agent for ServerAgent {
                             }
                         }
                         Err(e) => {
-                            conn.close(format!("fd拨号失败,addr: {} err: {}",addr,e.to_string())).await;
+                            conn.close(format!("fd拨号失败,addr: {} err: {}", addr, e.to_string()))
+                                .await;
 
                             return;
                         }
@@ -343,18 +334,16 @@ impl Agent for ServerAgent {
             }
             Cmd::Reg => {
                 let key = String::from_utf8_lossy(&data.body).to_string();
-
-                let mut map = CLIENT_M.lock().await;
-                if let Some(client) = map.get(&key) {
+                if let Some(client) = CLIENT_M.lock().await.get(&key) {
                     self.client = Some(client.clone());
                 } else {
-                    self.client = Some(Arc::new(Client {
+                    let client = Arc::new(Client {
                         //conn_m: Default::default(),
                         fd_m: Default::default(),
                         key: key.clone(),
-                    }));
-                    let client = self.client.as_ref().unwrap().clone();
-                    map.insert(key, client);
+                    });
+                    self.client = Some(client.clone());
+                    CLIENT_M.lock().await.insert(key, client);
                     data.cmd = Cmd::DeleteIp;
                     write_by_conn(tcp_conn, data).await?; //清空客户端的fd
                 }
@@ -416,7 +405,7 @@ impl Agent for ServerAgent {
         println!(
             "cmd: {:?} 结束 耗时{}ms",
             cmd,
-            now().unix_millis() - begen.unix_millis()
+            now().unix_millis() - begin.unix_millis()
         );
 
         return Ok(true);
@@ -474,17 +463,17 @@ impl ServerAgent {
             return Ok(());
         } else if msglen > 36 {
             let mut mysqlbuf = MsgBuffer::new();
-            mysqlbuf.write(&data[33..]);
+            mysqlbuf.write(&data[33..])?;
             let username = read_null_terminated_string(&mut mysqlbuf)?;
             let password = if flag & CLIENT_SECURE_CONNECTION != 0 {
-                let size = mysqlbuf.spare(1)[0] as usize;
-                String::from_utf8_lossy(&mysqlbuf.spare(size)).to_string()
+                let size = mysqlbuf.spare(1)?[0] as usize;
+                String::from_utf8_lossy(&mysqlbuf.spare(size)?).to_string()
             } else {
                 read_null_terminated_string(&mut mysqlbuf)?
             };
             //构建errpaket
             mysqlbuf.reset();
-            let b = mysqlbuf.make(13);
+            let b = mysqlbuf.make(13)?;
             b[3] = 2;
             b[4] = 0xff;
             LittleEndian::write_u16(&mut b[5..7], 1045);
@@ -492,21 +481,21 @@ impl ServerAgent {
             unsafe {
                 std::ptr::copy(data.as_ptr(), b[7..].as_mut_ptr(), 6);
             }
-            mysqlbuf.write_string("Access denied for user '");
-            mysqlbuf.write_string(username.as_str());
-            mysqlbuf.write_string("'@'");
+            mysqlbuf.write_string("Access denied for user '")?;
+            mysqlbuf.write_string(username.as_str())?;
+            mysqlbuf.write_string("'@'")?;
             let addr = conn.addr().to_string();
             let ip = addr.split(":").next().unwrap();
             match lookup_addr(&IpAddr::from_str(ip).unwrap()) {
-                Ok(host) => mysqlbuf.write_string(host.as_str()),
-                Err(_) => mysqlbuf.write_string(ip),
+                Ok(host) => mysqlbuf.write_string(host.as_str())?,
+                Err(_) => mysqlbuf.write_string(ip)?,
             };
 
-            mysqlbuf.write_string("' (using password: ");
+            mysqlbuf.write_string("' (using password: ")?;
             if password == "" {
-                mysqlbuf.write_string("NO))");
+                mysqlbuf.write_string("NO))")?;
             } else {
-                mysqlbuf.write_string("YES))");
+                mysqlbuf.write_string("YES))")?;
             }
             msglen = mysqlbuf.len() - 4;
             let b = &mut mysqlbuf.as_mut_slice()[..3];
@@ -546,9 +535,9 @@ async fn handle_socks(
             }
             Ok(n) => n?,
         };
-        if n==0{
+        if n == 0 {
             return Err(NetError::TcpDisconnected);
-        }else{
+        } else {
             let data = Data {
                 cmd: Cmd::Msg,
                 fd: conn.fd,
@@ -660,7 +649,6 @@ impl Conn {
                             println!("{:?}", res)
                         }
                     }
-
                 });
             }
         }

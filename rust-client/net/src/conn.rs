@@ -1,4 +1,5 @@
 use crate::afterfunc::AfterFn;
+use crate::buffer::MsgBuffer;
 use crate::AsyncWriteExt;
 use crate::Duration;
 use crate::Instant;
@@ -8,13 +9,13 @@ use ::tokio::macros::support::Poll::{Pending, Ready};
 use async_trait::async_trait;
 use openssl::ssl::{Ssl, SslAcceptor};
 use static_init::dynamic;
-use std::{fmt, mem};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::{fmt, mem};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
@@ -22,7 +23,6 @@ use tokio::time;
 use tokio::time::timeout_at;
 use tokio_native_tls::TlsAcceptor;
 use tokio_openssl::SslStream;
-use crate::buffer::MsgBuffer;
 
 pub type ConnAsyncFn<T> =
     Box<dyn for<'a> FnOnce(&'a mut T) -> ConnAsyncResult<'a> + Send + Sync + 'static>;
@@ -196,7 +196,10 @@ impl<T> TcpConn<T> {
     //})});
     pub async fn after_fn<F>(&mut self, delay: time::Duration, f: F)
     where
-        F: for<'b> FnOnce(&'b mut T,&'b mut TcpConn<T>) -> ConnAsyncResult<'b> + Send + Sync + 'static,
+        F: for<'b> FnOnce(&'b mut T, &'b mut TcpConn<T>) -> ConnAsyncResult<'b>
+            + Send
+            + Sync
+            + 'static,
     {
         self.after_fn.lock().await.add_fn(self.addr(), delay, f);
     }
@@ -349,7 +352,7 @@ where
                             }
                             ReactOperation::Afterfn(id) => {
                                 if let Some(f) = after_fn.lock().await.remove_task(id) {
-                                    f.call_once((agent,conn)).await?;
+                                    f.call_once((agent, conn)).await?;
                                 };
                             }
                         }
@@ -409,9 +412,9 @@ pub struct TcpConnBase {
     react_tx: Option<Sender<ReactOperationChannel>>,
 }
 impl TcpConnBase {
-    pub fn set_buf(&mut self, b: &[u8]) {
+    pub fn set_buf(&mut self, b: &[u8]) -> Result<(), NetError> {
         self.readbuf.reset();
-        self.readbuf.write(b);
+        Ok(self.readbuf.write(b)?)
     }
     pub fn new(addr: SocketAddr, stream: TcpStream) -> Self {
         Self {
@@ -450,7 +453,7 @@ impl TcpConnBase {
     }
     /// 写入数据到缓冲区，记得最后调用write_flush()写出数据到socket
     pub async fn buffer_write(&mut self, data: &[u8]) -> Result<(), NetError> {
-        self.writebuf.write(data);
+        self.writebuf.write(data)?;
         //暂定大于16384就先写出
         if self.writebuf.len() > 16384 {
             self.write_flush().await?;
@@ -461,7 +464,7 @@ impl TcpConnBase {
         Ok(timeout_at(Instant::now() + self.readtimeout, self.do_read_data()).await??)
     }
     async fn do_read_data(&mut self) -> Result<(), NetError> {
-        let buffer = self.readbuf.spare(8192);
+        let buffer = self.readbuf.spare(8192)?;
 
         let size = self.stream.read(buffer).await?;
 
@@ -505,10 +508,10 @@ impl TcpConnBase {
         self.readbuf.as_slice()
     }
     pub fn buffer_next(&mut self) -> Option<u8> {
-        self.readbuf.next()
+        self.readbuf.0.next()
     }
     pub fn buffer_nth(&mut self, u: usize) -> Option<u8> {
-        self.readbuf.nth(u)
+        self.readbuf.0.nth(u)
     }
     pub async fn readline(&self) -> Result<String, NetError> {
         Err(NetError::Custom("readline未处理".to_string()))
@@ -544,15 +547,17 @@ impl TcpConnBase {
     pub fn addr(&self) -> SocketAddr {
         self.addr
     }
-    fn take_stream(&mut self)->Stream {
-       mem::replace(&mut self.stream, Stream::None)
+    fn take_stream(&mut self) -> Stream {
+        mem::replace(&mut self.stream, Stream::None)
     }
     pub async fn upgrade_ssl(&mut self, acceptor: Arc<TlsAcceptor>) -> Result<(), NetError> {
         if let Stream::Tcp(tcp_stream) = self.take_stream() {
             let tls_stream = acceptor.accept(tcp_stream).await?;
             self.stream = Stream::ServerSsl(tls_stream);
-        }else {
-            return Err(NetError::Tls("It can only be upgraded from TcpStream to SSL".to_string()))
+        } else {
+            return Err(NetError::Tls(
+                "It can only be upgraded from TcpStream to SSL".to_string(),
+            ));
         }
         Ok(())
     }
@@ -565,8 +570,10 @@ impl TcpConnBase {
                 .await
                 .or_else(|e| Err(NetError::Tls(e.to_string())))?;
             self.stream = Stream::Openssl(stream);
-        }else {
-            return Err(NetError::Tls("It can only be upgraded from TcpStream to SSL".to_string()))
+        } else {
+            return Err(NetError::Tls(
+                "It can only be upgraded from TcpStream to SSL".to_string(),
+            ));
         }
         Ok(())
     }

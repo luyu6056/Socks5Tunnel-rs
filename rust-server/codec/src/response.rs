@@ -54,7 +54,6 @@ pub struct Response {
     body: ResponseBody,
 }
 use crate::Result;
-use net::err::NetError;
 use std::collections::HashMap;
 use std::{fmt, usize};
 
@@ -255,7 +254,7 @@ impl Response {
         conn.buffer_write(&size.to_string().as_bytes()).await?;
         if size > 0 {
             conn.buffer_write(b"\r\n\r\n").await?;
-            let mut data = [0; 163840];
+            let mut data = [0; 16384];
             while self.body.len()? > 0 {
                 let n = self.body.read(&mut data)?;
                 conn.buffer_write(&data[..n]).await?;
