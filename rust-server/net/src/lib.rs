@@ -128,10 +128,10 @@ impl Server {
                     },
 
                     __tokio_select_util::Out::_2(now) => {
-                        let mut afterfn = afterfn.lock().await;
+                        let mut afterfn = afterfn.try_lock().unwrap();
                         afterfn.check_delete(now);
                         if let Some((addr, id)) = afterfn.get_taskaddr_from_time(now) {
-                            if let Some(react_tx) = conn_map.lock().await.get_mut(&addr) {
+                            if let Some(react_tx) = conn_map.try_lock().unwrap().get_mut(&addr) {
                                 let _ =react_tx.try_send(ReactOperationChannel {
                                     op: ReactOperation::Afterfn(id),
                                     res: None,
@@ -175,7 +175,7 @@ impl Server {
 
         //let readwg = wg.add(1);
         let _react_tx = react_tx.clone();
-        conn_map.lock().await.insert(addr, _react_tx);
+        conn_map.try_lock().unwrap().insert(addr, _react_tx);
 
         //启动react
         let reactwg = wg.add(1);
@@ -205,7 +205,7 @@ impl Server {
 
         tokio::spawn(async move {
             wg.wait().await;
-            conn_map.lock().await.remove(&addr);
+            conn_map.try_lock().unwrap().remove(&addr);
         });
         /*tokio::spawn(async move {
             if let Err(NetError::ShutdownServer(e)) =

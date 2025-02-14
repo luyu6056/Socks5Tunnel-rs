@@ -51,6 +51,9 @@ pub enum NetError {
     JsonErr(String),
     #[error("tls 错误 {0}")]
     Tls(String),
+
+    #[error("LockErr")]
+    LockErr,
 }
 
 impl NetError {
@@ -58,6 +61,11 @@ impl NetError {
         NetError::Custom(s)
     }
 }
+// impl From<tokio::sync::TryLockError> for NetError {
+//     fn from(e: tokio::sync::TryLockError) -> NetError {
+//         NetError::LockErr
+//     }
+// }
 impl std::convert::From<std::io::Error> for NetError {
     fn from(err: std::io::Error) -> Self {
         NetError::IoError(err.to_string())

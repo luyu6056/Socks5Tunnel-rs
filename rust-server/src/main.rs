@@ -1,4 +1,5 @@
 #![feature(mem_copy_fn)]
+#![feature(backtrace_frames)]
 
 use crate::cmd::Cmd;
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
@@ -23,13 +24,14 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::*;
 use std::time::Duration;
+use tokio::io;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::net::tcp::OwnedReadHalf;
-use tokio::sync::Mutex;
 use tokio::sync::mpsc::*;
 use tokio::time::{Instant, timeout, timeout_at};
 use tokio_native_tls::native_tls::Identity;
+use utils::Mutex;
 
 mod cmd;
 pub mod utils;
@@ -66,7 +68,7 @@ async fn main() -> std::io::Result<()> {
 
     let tls_acceptor = native_tls::TlsAcceptor::new(identity).unwrap();
     let tls_acceptor: Arc<TlsAcceptor> = Arc::new(tls_acceptor.into());
-    let tls_acceptor2 = tls_acceptor.clone();
+
     // 创建 SSL/TLS 上下文
     let mut openssl_acceptor = SslAcceptor::mozilla_intermediate(SslMethod::tls()).unwrap();
     openssl_acceptor.set_private_key(key.as_ref()).unwrap();
@@ -103,7 +105,7 @@ async fn main() -> std::io::Result<()> {
     Server::new()
         .start_server(addr, ServerAgent {
             client: None,
-            tls_acceptor: tls_acceptor2,
+            //tls_acceptor: tls_acceptor2,
             openssl_acceptor: openssl_acceptor2,
         })
         .await
@@ -152,22 +154,20 @@ static BAD_HANDSHAKE: &[u8] = &[
 const CLIENT_SSL: u32 = 0x00000800;
 const CLIENT_SECURE_CONNECTION: u32 = 0x00008000;
 
-#[dynamic]
-static CLIENT_M: Arc<Mutex<HashMap<String, Arc<Client>>>> = Arc::new(Mutex::new(HashMap::new()));
 use crate::utils::now;
 use tokio_native_tls::{TlsAcceptor, native_tls};
 
 #[derive(Clone)]
 pub struct ServerAgent {
     client: Option<Arc<Client>>,
-    tls_acceptor: Arc<TlsAcceptor>,
+    //tls_acceptor: Arc<TlsAcceptor>,
     openssl_acceptor: Arc<SslAcceptor>,
 }
 
 struct Client {
     //conn_m: Mutex<HashMap<String, Arc<Client>>>,
     fd_m: Mutex<HashMap<[u8; 2], Arc<Box<Conn>>>>,
-    key: String,
+    //key: String,
 }
 impl Client {
     async fn get_fd_conn(&self, fd: &[u8; 2]) -> Option<Arc<Box<Conn>>> {
@@ -238,9 +238,6 @@ impl Agent for ServerAgent {
     }
 
     async fn react(&mut self, tcp_conn: &mut TcpConn<Self>) -> Result<bool, NetError> {
-        #[cfg(debug_assertions)]
-        let begin = now();
-
         let in_data = tcp_conn.buffer_data();
         let length = (in_data[0] as usize) + ((in_data[1] as usize) << 8);
         if in_data.len() < length {
@@ -251,12 +248,13 @@ impl Agent for ServerAgent {
         #[cfg(debug_assertions)]
         let cmd = data.cmd.clone();
         #[cfg(debug_assertions)]
-        if DEBUG_LEN == 8 {
-            println!(
-                "cmd: {:?} 开始 耗时{}ms",
-                data.cmd,
-                now().unix_millis() - data.timestamp.unwrap()
-            );
+        let begin = data.timestamp;
+        #[cfg(debug_assertions)]
+        if let Some(begin) = begin {
+            let diff = now().unix_millis() - begin;
+            if diff > 0 {
+                println!("cmd: {:?} 开始 耗时{}ms", data.cmd, diff);
+            }
         }
 
         //主逻辑
@@ -333,20 +331,17 @@ impl Agent for ServerAgent {
                 });
             }
             Cmd::Reg => {
-                let key = String::from_utf8_lossy(&data.body).to_string();
-                if let Some(client) = CLIENT_M.lock().await.get(&key) {
-                    self.client = Some(client.clone());
-                } else {
-                    let client = Arc::new(Client {
-                        //conn_m: Default::default(),
-                        fd_m: Default::default(),
-                        key: key.clone(),
-                    });
-                    self.client = Some(client.clone());
-                    CLIENT_M.lock().await.insert(key, client);
-                    data.cmd = Cmd::DeleteIp;
-                    write_by_conn(tcp_conn, data).await?; //清空客户端的fd
-                }
+                //let key = String::from_utf8_lossy(&data.body).to_string();
+
+                let client = Arc::new(Client {
+                    //conn_m: Default::default(),
+                    fd_m: Default::default(),
+                    //key: key.clone(),
+                });
+                self.client = Some(client.clone());
+                data.cmd = Cmd::DeleteIp;
+                write_by_conn(tcp_conn, data).await?; //清空客户端的fd
+
                 //let mut data=vec![255; 65535 ];
                 //data[2]=0;
                 //tcp_conn.write_data(data).await?; //消灭分包
@@ -402,11 +397,12 @@ impl Agent for ServerAgent {
             }
         }
         #[cfg(debug_assertions)]
-        println!(
-            "cmd: {:?} 结束 耗时{}ms",
-            cmd,
-            now().unix_millis() - begin.unix_millis()
-        );
+        if let Some(begin) = begin {
+            let diff = now().unix_millis() - begin;
+            if diff > 0 {
+                println!("cmd: {:?} 结束 耗时{}ms", cmd, diff);
+            }
+        }
 
         return Ok(true);
     }
@@ -415,10 +411,6 @@ impl Agent for ServerAgent {
         _conn: &mut TcpConn<Self>,
         _reasion: Option<String>,
     ) -> Result<(), NetError> {
-        if let Some(client) = &self.client {
-            let key = client.key.clone();
-            CLIENT_M.lock().await.remove(&key);
-        }
         Ok(())
     }
 }
@@ -527,33 +519,46 @@ async fn handle_socks(
     let mut buf: Vec<u8> = vec![0; MAX_PLAINTEXT - HEAD_LEN];
 
     while !conn.is_close.load(Ordering::Relaxed) {
-        let n = match timeout(Duration::from_secs(10), read.read(&mut buf)).await {
-            Err(_) => {
+        let r = match timeout(Duration::from_secs(10), read.read(&mut buf)).await {
+            Err(_e) => {
                 //#[cfg(debug_assertions)]
-                //println!("{:?} 超时了吗? {:?}",now(), e);
+                //println!("{:?} 超时了吗? {:?}", now(), e);
                 continue;
             }
-            Ok(n) => n?,
+            Ok(r) => r,
         };
-        if n == 0 {
-            return Err(NetError::TcpDisconnected);
-        } else {
-            let data = Data {
-                cmd: Cmd::Msg,
-                fd: conn.fd,
-                body: &buf[..n],
-                timestamp: None,
-            };
-            write_by_conn(&mut conn_writer, data).await?;
-            conn.windows_size
-                .fetch_add(-1 * (n as i64), Ordering::Relaxed);
-            while !conn.is_close.load(Ordering::Relaxed)
-                && conn.windows_size.load(Ordering::Relaxed) <= 0
-            {
-                let flag =
-                    timeout_at(Instant::now() + Duration::from_secs(1), wait_rx.recv()).await?;
-                if flag.is_some() && !flag.unwrap() {
-                    return Ok(());
+        match r {
+            Ok(n) => {
+                if n == 0 {
+                    //println!("{:?} Connection closed.", conn.address);
+                    return Err(NetError::TcpDisconnected);
+                } else {
+                    let data = Data {
+                        cmd: Cmd::Msg,
+                        fd: conn.fd,
+                        body: &buf[..n],
+                        timestamp: None,
+                    };
+                    write_by_conn(&mut conn_writer, data).await?;
+                    conn.windows_size
+                        .fetch_add(-1 * (n as i64), Ordering::Relaxed);
+                    while !conn.is_close.load(Ordering::Relaxed)
+                        && conn.windows_size.load(Ordering::Relaxed) <= 0
+                    {
+                        let flag =
+                            timeout_at(Instant::now() + Duration::from_secs(1), wait_rx.recv())
+                                .await?;
+                        if flag.is_some() && !flag.unwrap() {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                if let io::ErrorKind::WouldBlock = e.kind() {
+                    continue;
+                } else {
+                    return Err(e.into());
                 }
             }
         }
@@ -639,12 +644,12 @@ impl Conn {
             if old < 0 {
                 let tx = self.wait_tx.clone();
                 tokio::spawn(async move {
-                    let res = timeout(Duration::from_secs(1), tx.send(true)).await;
+                    let _res = timeout(Duration::from_secs(1), tx.send(true)).await;
                     #[cfg(debug_assertions)]
-                    if res.is_err() {
-                        println!("{:?}", res)
+                    if _res.is_err() {
+                        println!("{:?}", _res)
                     } else {
-                        let res = res.unwrap();
+                        let res = _res.unwrap();
                         if res.is_err() {
                             println!("{:?}", res)
                         }

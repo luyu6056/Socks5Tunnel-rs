@@ -20,7 +20,7 @@ pub(crate) struct Socks5Agent {
 }
 #[derive(Clone)]
 pub(crate) enum SocksAuth {
-    Close,
+    //Close,
     None,
     Pw,
     Ok,
@@ -41,9 +41,11 @@ unsafe impl Send for Socks5Agent {}
 impl Agent for Socks5Agent {
     async fn on_opened(&mut self, conn: &mut TcpConn<Self>) -> Result<(), NetError> {
         for _ in 0..RETRY_NUM {
-            let list = SERVER_TX.lock().await;
-            let index = fastrand::usize(0..list.len());
-            let tx = list[index].clone();
+            let tx = {
+                let list = SERVER_TX.lock().await;
+                let index = fastrand::usize(0..list.len());
+                 list[index].clone()
+            };
             if tx.status.load(Ordering::Relaxed) {
                 let fd=tx.fd.clone();
                 let mut fd_m = fd.lock().await;
@@ -85,9 +87,9 @@ impl Agent for Socks5Agent {
         let meg_len=data.len();
 
         match self.auth {
-            SocksAuth::Close => {
-                return Err(NetError::Custom("SocksAuth::Close".to_string()));
-            }
+            // SocksAuth::Close => {
+            //     return Err(NetError::Custom("SocksAuth::Close".to_string()));
+            // }
             SocksAuth::None => {
                 if data.len() > 2 {
                     if data[..3] == [5, 1, 0] {
@@ -112,14 +114,14 @@ impl Agent for Socks5Agent {
                         for v in &data[4..7] {
                             buf.write_string((v.to_string() + ".").as_str())?;
                         }
-                        buf.write_string((data[8].to_string()).as_ref())?;
+                        buf.write_string((data[7].to_string()).as_ref())?;
+                        println!("{:?}",String::from_utf8_lossy(buf.0.bytes()));
                         buf.write(&data[data.len() - 2..])?;
                         self.getfd(buf.as_slice()).await?;
                         self.auth = SocksAuth::Message;
                         conn.write_byte([5, 0, 0, 1, 0, 0, 0, 0, 0, 0].as_ref())
                             .await?;
                     }
-
                     3 => {
                         self.getfd(&data[5..]).await?;
                         self.auth = SocksAuth::Message;

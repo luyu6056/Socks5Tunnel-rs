@@ -67,9 +67,9 @@ impl ConnWriter {
             })
             .await?)
     }
-    pub fn close(&self, _reason: Option<impl Into<String>>) -> Result<(), NetError> {
+    pub fn close(&self, reason: Option<String>) -> Result<(), NetError> {
         Ok(self.react_tx.try_send(ReactOperationChannel {
-            op: ReactOperation::Exit,
+            op: ReactOperation::Exit(reason),
             res: None,
         })?)
     }
@@ -156,9 +156,9 @@ impl<T> TcpConn<T> {
         self.inner.buffer_len()
     }
     //关闭连接
-    pub fn close(&self, _reason: Option<impl Into<String>>) -> Result<(), NetError> {
+    pub fn close(&self, reason: Option<String>) -> Result<(), NetError> {
         Ok(self.react_tx.try_send(ReactOperationChannel {
-            op: ReactOperation::Exit,
+            op: ReactOperation::Exit(reason),
             res: None,
         })?)
     }
@@ -201,7 +201,7 @@ impl<T> TcpConn<T> {
             + Sync
             + 'static,
     {
-        self.after_fn.lock().await.add_fn(self.addr(), delay, f);
+        self.after_fn.try_lock().unwrap().add_fn(self.addr(), delay, f);
     }
 
     pub fn channel_write(&self, data: Vec<u8>) -> Result<(), NetError> {
@@ -244,7 +244,7 @@ pub struct ReactOperationChannel {
 }
 #[derive(Debug)]
 pub(crate) enum ReactOperation {
-    Exit, //退出handler
+    Exit(Option<String>), //退出handler
     ExitServer(Option<String>),
     Write(WriteData),
     Afterfn(u64),
@@ -269,6 +269,7 @@ where
 {
     let after_fn = conn.after_fn.clone();
     agent.on_opened(conn).await?;
+
     let mut exit_reason: Option<String> = None;
     //ctx.set_conn(conn.clone());
     #[doc(hidden)]
@@ -343,7 +344,8 @@ where
                                     }
                                 }
                             },
-                            ReactOperation::Exit => {
+                            ReactOperation::Exit(reason) => {
+                                exit_reason = reason;
                                 break;
                             }
                             ReactOperation::ExitServer(reason) => {
@@ -351,7 +353,7 @@ where
                                 break;
                             }
                             ReactOperation::Afterfn(id) => {
-                                if let Some(f) = after_fn.lock().await.remove_task(id) {
+                                if let Some(f) = after_fn.try_lock().unwrap().remove_task(id) {
                                     f.call_once((agent, conn)).await?;
                                 };
                             }
@@ -516,10 +518,10 @@ impl TcpConnBase {
     pub async fn readline(&self) -> Result<String, NetError> {
         Err(NetError::Custom("readline未处理".to_string()))
     }
-    pub fn close(&self, _reason: Option<impl Into<String>>) -> Result<(), NetError> {
+    pub fn close(&self, reason: Option<String>) -> Result<(), NetError> {
         if let Some(tx) = &self.react_tx {
             return Ok(tx.try_send(ReactOperationChannel {
-                op: ReactOperation::Exit,
+                op: ReactOperation::Exit(reason),
                 res: None,
             })?);
         };

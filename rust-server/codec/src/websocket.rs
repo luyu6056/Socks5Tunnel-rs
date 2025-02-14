@@ -119,7 +119,7 @@ impl WSconn {
                 return Ok(None);
             }
             MessageType::CloseMessage => {
-                conn.close(Some("from websocket closeMessage"))?;
+                conn.close(Some("from websocket closeMessage".to_owned()))?;
                 return Err(NetError::Close);
             }
             other => {
